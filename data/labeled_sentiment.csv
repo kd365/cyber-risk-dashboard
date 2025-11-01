@@ -1,0 +1,6 @@
+id,ticker,text,label
+1,CRWD,"We experienced a significant breach in Q2.",negative
+2,PANW,"Revenue grew 25% year-over-year.",positive
+3,OKTA,"We are investigating a third-party incident.",neutral
+4,ZS,"Customer retention remains strong despite macro headwinds.",positive
+5,NET,"We expect regulatory pressure to increase.",negative
