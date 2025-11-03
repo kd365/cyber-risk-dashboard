@@ -1,0 +1,29 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+.env
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Logs and temp files
+*.log
+*.tmp
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# Dash data artifacts
+data/processed/
+data/status_*.json
+
+# AWS credentials (if any)
+.aws/
