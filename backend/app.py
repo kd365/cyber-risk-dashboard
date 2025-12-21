@@ -14,8 +14,10 @@ from backend.services.growth_cache import GrowthCache
 from backend.services.explorium_service import ExploriumService, get_company_domain
 from backend.services.lex_service import LexService
 from backend.services.database_service import db_service
+from backend.services.scraper import SecTranscriptScraper
 from backend.models.time_series_forecaster import CyberRiskForecaster
 import traceback
+import threading
 
 app = Flask(__name__)
 CORS(app)
@@ -444,37 +446,108 @@ def evaluate_model(ticker):
         return jsonify({'error': str(e)}), 500
 
 # ============================================================================
-# SCRAPING STATUS ENDPOINT (Placeholder)
+# SCRAPING ENDPOINTS
 # ============================================================================
+
+# Global scraping state
+scraping_status = {
+    'running': False,
+    'progress': 0,
+    'message': 'Ready',
+    'current_company': None,
+    'results': []
+}
+
+def run_scraping_task(companies, scrape_type):
+    """Background task to scrape companies"""
+    global scraping_status
+
+    scraping_status['running'] = True
+    scraping_status['progress'] = 0
+    scraping_status['results'] = []
+
+    scraper = SecTranscriptScraper()
+    total = len(companies)
+
+    for i, ticker in enumerate(companies):
+        try:
+            scraping_status['current_company'] = ticker
+            scraping_status['message'] = f'Scraping {ticker} ({i+1}/{total})...'
+            scraping_status['progress'] = int((i / total) * 100)
+
+            result = {'ticker': ticker, 'sec_filings': 0, 'transcripts': 0, 'errors': []}
+
+            # Scrape SEC filings
+            if scrape_type in ['all', 'sec']:
+                try:
+                    filings = scraper.scrape_sec_filings(ticker, num_filings=5)
+                    if filings:
+                        saved = scraper.save_raw_pdf_files(filings)
+                        result['sec_filings'] = len(saved)
+                except Exception as e:
+                    result['errors'].append(f'SEC: {str(e)}')
+
+            # Scrape transcripts
+            if scrape_type in ['all', 'transcripts']:
+                try:
+                    transcripts = scraper.scrape_earnings_transcripts(ticker, num_quarters=4)
+                    result['transcripts'] = len(transcripts)
+                except Exception as e:
+                    result['errors'].append(f'Transcripts: {str(e)}')
+
+            scraping_status['results'].append(result)
+
+        except Exception as e:
+            scraping_status['results'].append({
+                'ticker': ticker,
+                'sec_filings': 0,
+                'transcripts': 0,
+                'errors': [str(e)]
+            })
+
+    scraping_status['running'] = False
+    scraping_status['progress'] = 100
+    scraping_status['current_company'] = None
+    scraping_status['message'] = f'Completed scraping {total} companies'
+
 
 @app.route('/api/scraping/status', methods=['GET'])
 def get_scraping_status():
     """Get scraping progress status"""
-    scrape_type = request.args.get('type', 'sec')
-    
-    # TODO: Read from S3 status files
-    # For now, return mock status
-    return jsonify({
-        'running': False,
-        'progress': 100,
-        'message': 'No scraping in progress',
-        'type': scrape_type
-    })
+    return jsonify(scraping_status)
+
 
 @app.route('/api/scraping/start', methods=['POST'])
 def start_scraping():
-    """Start scraping process"""
-    data = request.json
-    scrape_type = data.get('type', 'sec')
+    """Start scraping process in background"""
+    global scraping_status
+
+    if scraping_status['running']:
+        return jsonify({
+            'status': 'error',
+            'message': 'Scraping already in progress'
+        }), 400
+
+    data = request.json or {}
+    scrape_type = data.get('type', 'all')
     companies = data.get('companies', [])
 
-    # TODO: Trigger scraping scripts
-    # For now, return success
+    if not companies:
+        return jsonify({
+            'status': 'error',
+            'message': 'No companies specified'
+        }), 400
+
+    # Start scraping in background thread
+    thread = threading.Thread(target=run_scraping_task, args=(companies, scrape_type))
+    thread.daemon = True
+    thread.start()
+
     return jsonify({
         'status': 'started',
         'type': scrape_type,
         'companies': companies,
-        'message': 'Scraping initiated (not yet implemented)'
+        'message': f'Started scraping {len(companies)} companies'
     })
 
 # ============================================================================

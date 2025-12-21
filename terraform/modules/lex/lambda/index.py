@@ -8,6 +8,8 @@ import os
 import re
 import psycopg2
 from psycopg2.extras import RealDictCursor
+import urllib.request
+import urllib.error
 
 # Database connection parameters from environment
 DB_CONFIG = {
@@ -15,8 +17,11 @@ DB_CONFIG = {
     'database': os.environ.get('DB_NAME'),
     'user': os.environ.get('DB_USER'),
     'password': os.environ.get('DB_PASSWORD'),
-    'port': 5432
+    'port': int(os.environ.get('DB_PORT', 5432))
 }
+
+# API endpoint for triggering analysis
+API_BASE_URL = os.environ.get('API_BASE_URL', 'http://internal-cyberrisk-dev-kh-alb-1840593498.us-west-2.elb.amazonaws.com:5000')
 
 # Known company mappings for entity extraction
 KNOWN_COMPANIES = {
@@ -47,6 +52,25 @@ KNOWN_COMPANIES = {
 def get_db_connection():
     """Create database connection"""
     return psycopg2.connect(**DB_CONFIG)
+
+def call_api(endpoint, timeout=30):
+    """Call the backend API and return JSON response"""
+    try:
+        url = f"{API_BASE_URL}{endpoint}"
+        print(f"Calling API: {url}")
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            return data
+    except urllib.error.HTTPError as e:
+        print(f"API HTTP Error: {e.code} - {e.reason}")
+        return None
+    except urllib.error.URLError as e:
+        print(f"API URL Error: {e.reason}")
+        return None
+    except Exception as e:
+        print(f"API Error: {str(e)}")
+        return None
 
 def extract_company_from_utterance(utterance):
     """
@@ -93,14 +117,12 @@ def find_company_by_alias(search_term):
             conn.close()
             return (row['id'], row['ticker'], row['company_name'])
 
-        # Try alias table
+        # Try alternate_names column
         cursor.execute("""
-            SELECT c.id, c.ticker, c.company_name
-            FROM companies c
-            JOIN company_aliases ca ON c.id = ca.company_id
-            WHERE LOWER(ca.alias) = LOWER(%s)
-               OR LOWER(ca.alias) LIKE LOWER(%s)
-        """, (search_term, f'%{search_term}%'))
+            SELECT id, ticker, company_name
+            FROM companies
+            WHERE LOWER(alternate_names) LIKE LOWER(%s)
+        """, (f'%{search_term}%',))
 
         row = cursor.fetchone()
         cursor.close()
@@ -242,10 +264,12 @@ Would you like to know about sentiment or forecasts for this company?"""
     return close_response({}, 'Fulfilled', message)
 
 def handle_sentiment_analysis(event):
-    """Get sentiment analysis for a company"""
+    """Get sentiment analysis for a company - triggers analysis via API if not cached"""
     # Try to get company from slots first
     slots = event['sessionState']['intent']['slots'] or {}
     company_name = None
+    ticker = None
+
     if slots.get('CompanyName'):
         company_name = slots['CompanyName'].get('value', {}).get('interpretedValue', '')
 
@@ -255,63 +279,103 @@ def handle_sentiment_analysis(event):
         extracted_name, extracted_ticker = extract_company_from_utterance(utterance)
         if extracted_ticker:
             company_name = extracted_ticker
+            ticker = extracted_ticker
         elif extracted_name:
             company_name = extracted_name
 
     if not company_name:
         return close_response({}, 'Failed', "Which company would you like sentiment analysis for? Try saying 'sentiment for CrowdStrike' or 'sentiment for CRWD'.")
 
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-
-        cursor.execute("""
-            SELECT c.company_name, c.ticker,
-                   AVG(CASE WHEN s.sentiment = 'POSITIVE' THEN 1
-                            WHEN s.sentiment = 'NEGATIVE' THEN -1
-                            ELSE 0 END) as avg_sentiment,
-                   COUNT(*) as analyzed_docs,
-                   SUM(CASE WHEN s.sentiment = 'POSITIVE' THEN 1 ELSE 0 END) as positive_count,
-                   SUM(CASE WHEN s.sentiment = 'NEGATIVE' THEN 1 ELSE 0 END) as negative_count,
-                   SUM(CASE WHEN s.sentiment = 'NEUTRAL' THEN 1 ELSE 0 END) as neutral_count
-            FROM companies c
-            JOIN artifacts a ON c.id = a.company_id
-            JOIN sentiment_analysis s ON a.id = s.artifact_id
-            WHERE LOWER(c.company_name) LIKE LOWER(%s)
-               OR LOWER(c.ticker) = LOWER(%s)
-            GROUP BY c.id, c.company_name, c.ticker
-        """, (f'%{company_name}%', company_name))
-
-        result = cursor.fetchone()
-        cursor.close()
-        conn.close()
-
-        if result:
-            sentiment_label = "Positive" if result['avg_sentiment'] > 0.1 else "Negative" if result['avg_sentiment'] < -0.1 else "Neutral"
-            message = f"""Sentiment Analysis for {result['company_name']} ({result['ticker']}):
-
-Overall Sentiment: {sentiment_label}
-Documents Analyzed: {result['analyzed_docs']}
-
-Breakdown:
-- Positive: {result['positive_count']} documents
-- Neutral: {result['neutral_count']} documents
-- Negative: {result['negative_count']} documents
-
-This analysis is powered by AWS Comprehend, which examines SEC filings and earnings call transcripts to determine market sentiment."""
+    # Look up the ticker if we don't have it
+    if not ticker:
+        company_id, db_ticker, db_company_name = find_company_by_alias(company_name)
+        if db_ticker:
+            ticker = db_ticker
+            company_name = db_company_name
         else:
-            message = f"I don't have sentiment data for '{company_name}'. The company may not be in our database or analysis hasn't been run yet."
+            # Use the company name as ticker (might work for some)
+            ticker = company_name.upper()
 
-    except Exception as e:
-        message = f"I encountered an error retrieving sentiment data: {str(e)}"
+    # Call the sentiment API - this will trigger analysis if not cached
+    print(f"Fetching sentiment for ticker: {ticker}")
+    sentiment_data = call_api(f"/api/sentiment/{ticker}")
+
+    if sentiment_data and 'error' not in sentiment_data:
+        # Successfully got sentiment data - parse actual API response structure
+        overall = sentiment_data.get('overall', {})
+        overall_sentiment = overall.get('sentiment', {})
+
+        # Determine dominant sentiment
+        sentiment_scores = {
+            'Positive': overall_sentiment.get('Positive', 0),
+            'Negative': overall_sentiment.get('Negative', 0),
+            'Neutral': overall_sentiment.get('Neutral', 0),
+            'Mixed': overall_sentiment.get('Mixed', 0)
+        }
+        sentiment_label = max(sentiment_scores, key=sentiment_scores.get)
+        confidence = sentiment_scores[sentiment_label]
+
+        # Get document breakdown from documentComparison
+        doc_comparison = sentiment_data.get('documentComparison', {})
+        sec_data = doc_comparison.get('sec', {})
+        transcript_data = doc_comparison.get('transcripts', {})
+
+        sec_count = sec_data.get('documentCount', 0)
+        transcript_count = transcript_data.get('documentCount', 0)
+
+        # Get SEC sentiment label
+        sec_sentiment_scores = sec_data.get('sentiment', {})
+        sec_label = max(sec_sentiment_scores, key=sec_sentiment_scores.get) if sec_sentiment_scores else 'N/A'
+
+        # Get transcript sentiment label
+        transcript_sentiment_scores = transcript_data.get('sentiment', {})
+        transcript_label = max(transcript_sentiment_scores, key=transcript_sentiment_scores.get) if transcript_sentiment_scores else 'N/A'
+
+        from_cache = sentiment_data.get('from_cache', False)
+        cache_status = "(from cache)" if from_cache else "(freshly analyzed)"
+
+        # Get top words instead of key_phrases
+        top_words = sentiment_data.get('wordFrequency', [])[:5]
+        top_words_str = chr(10).join([f"- {w.get('text', '')} ({w.get('count', 0)} occurrences)" for w in top_words])
+
+        # Get insights if available
+        insights = doc_comparison.get('insights', [])
+        insights_str = ""
+        if insights:
+            insights_str = f"\n\nInsights:\n" + chr(10).join([f"- {i}" for i in insights])
+
+        message = f"""Sentiment Analysis for {ticker} {cache_status}:
+
+Overall Sentiment: {sentiment_label} (confidence: {confidence:.1%})
+
+SEC Filings: {sec_label} ({sec_count} documents)
+Earnings Transcripts: {transcript_label} ({transcript_count} documents)
+
+Top Keywords:
+{top_words_str}{insights_str}
+
+This analysis is powered by AWS Comprehend, which examines SEC filings and earnings call transcripts."""
+
+    elif sentiment_data and 'error' in sentiment_data:
+        # API returned an error
+        error_msg = sentiment_data.get('error', 'Unknown error')
+        if 'No documents found' in error_msg:
+            message = f"I don't have any documents for {ticker} to analyze yet. Please scrape some SEC filings or earnings transcripts first using the dashboard."
+        else:
+            message = f"I couldn't analyze sentiment for {ticker}: {error_msg}"
+    else:
+        # API call failed completely
+        message = f"I'm having trouble connecting to the analysis service. Please try again in a moment or check the dashboard directly for {ticker} sentiment."
 
     return close_response({}, 'Fulfilled', message)
 
 def handle_forecast(event):
-    """Get forecast information for a company"""
+    """Get forecast information for a company - triggers forecast via API"""
     # Try to get company from slots first
     slots = event['sessionState']['intent']['slots'] or {}
     company_name = None
+    ticker = None
+
     if slots.get('CompanyName'):
         company_name = slots['CompanyName'].get('value', {}).get('interpretedValue', '')
 
@@ -321,25 +385,85 @@ def handle_forecast(event):
         extracted_name, extracted_ticker = extract_company_from_utterance(utterance)
         if extracted_ticker:
             company_name = extracted_ticker
+            ticker = extracted_ticker
         elif extracted_name:
             company_name = extracted_name
 
     if not company_name:
         return close_response({}, 'Failed', "Which company would you like a forecast for?")
 
-    message = f"""Forecast information for {company_name}:
+    # Look up the ticker if we don't have it
+    if not ticker:
+        company_id, db_ticker, db_company_name = find_company_by_alias(company_name)
+        if db_ticker:
+            ticker = db_ticker
+            company_name = db_company_name
+        else:
+            ticker = company_name.upper()
 
-The dashboard uses Facebook Prophet for time series forecasting of stock prices. The forecast includes:
+    forecast_data = call_api(f"/api/forecast?ticker={ticker}&days=30", timeout=10)
 
-- 30-day price predictions
-- Confidence intervals (upper and lower bounds)
-- Trend analysis and seasonality detection
+    if forecast_data and 'error' not in forecast_data:
+        current_price = forecast_data.get('current_price', 0)
+        predicted_price = forecast_data.get('predicted_price', 0)
+        expected_return = forecast_data.get('expected_return_pct', 0)
+        confidence = forecast_data.get('confidence_interval', {})
+        from_cache = forecast_data.get('from_cache', False)
 
-To view the actual forecast chart and predictions, please visit the Forecast tab on the dashboard and select {company_name} from the dropdown.
+        # Determine trend direction and strength
+        if expected_return > 5:
+            trend = "strong upward trend"
+        elif expected_return > 0:
+            trend = "slight upward trend"
+        elif expected_return > -5:
+            trend = "slight downward trend"
+        else:
+            trend = "strong downward trend"
 
-Note: Forecasts are for educational purposes and should not be considered financial advice."""
+        # Try to get model evaluation metrics
+        eval_data = call_api(f"/api/evaluate/{ticker}", timeout=10)
+        mape_str = ""
+        if eval_data and 'mape' in eval_data:
+            mape = eval_data.get('mape', 0)
+            accuracy = 100 - mape
+            mape_str = f"\nModel Accuracy: {accuracy:.1f}% (MAPE: {mape:.1f}%)"
+
+        cache_status = "(cached)" if from_cache else "(fresh)"
+
+        message = f"""Forecast for {ticker} {cache_status}:
+
+The model predicts a {trend} over the next 30 days.
+
+Current Price: ${current_price:.2f}
+Predicted Price (30 days): ${predicted_price:.2f}
+Expected Return: {expected_return:+.1f}%
+
+Confidence Range: ${confidence.get('lower', 0):.2f} - ${confidence.get('upper', 0):.2f}{mape_str}
+
+Other analysis available:
+- "Sentiment for {ticker}" - AWS Comprehend NLP analysis
+- "Growth metrics for {ticker}" - Hiring trends & employee data
+- "Documents for {ticker}" - SEC filings inventory
+
+Note: Forecasts are for educational purposes only, not financial advice."""
+
+    elif forecast_data and 'error' in forecast_data:
+        message = f"I couldn't generate a forecast for {ticker}: {forecast_data.get('error', 'Unknown error')}\n\nTry asking about sentiment or documents instead."
+    else:
+        # Fallback to static message if API unavailable
+        message = f"""I'm having trouble generating a live forecast for {ticker} right now.
+
+You can view the forecast chart directly on the dashboard's Forecast tab.
+
+In the meantime, try:
+- "Sentiment for {ticker}" - Get NLP analysis of SEC filings
+- "Documents for {ticker}" - See what data is available
+- "List companies" - View all tracked companies
+
+Note: Forecasts use Facebook Prophet with 30-day predictions and confidence intervals."""
 
     return close_response({}, 'Fulfilled', message)
+
 
 def handle_dashboard_features(event):
     """Explain dashboard features"""
@@ -364,15 +488,12 @@ The dashboard focuses on cybersecurity companies: CrowdStrike, Palo Alto Network
 
 def handle_add_company(event):
     """Handle adding a new company to the database"""
-    # Get the user's utterance to extract company info
     utterance = event.get('inputTranscript', '')
     session_attributes = event.get('sessionState', {}).get('sessionAttributes', {})
 
-    # Check if we're in a conversation flow (collecting company details)
     pending_action = session_attributes.get('pending_action')
 
     if pending_action == 'add_company_name':
-        # User is providing company name
         company_name = utterance.strip()
         session_attributes['company_name'] = company_name
         session_attributes['pending_action'] = 'add_company_ticker'
@@ -380,20 +501,16 @@ def handle_add_company(event):
             f"Got it! The company name is '{company_name}'. What is the stock ticker symbol? (e.g., CRWD, PANW)")
 
     elif pending_action == 'add_company_ticker':
-        # User is providing ticker
         ticker = utterance.strip().upper()
         company_name = session_attributes.get('company_name', 'Unknown')
 
-        # Clear session state
         session_attributes.pop('pending_action', None)
         session_attributes.pop('company_name', None)
 
-        # Try to add to database
         try:
             conn = get_db_connection()
             cursor = conn.cursor(cursor_factory=RealDictCursor)
 
-            # Check if already exists
             cursor.execute("SELECT * FROM companies WHERE ticker = %s", (ticker,))
             existing = cursor.fetchone()
 
@@ -403,7 +520,6 @@ def handle_add_company(event):
                 return close_response(session_attributes, 'Fulfilled',
                     f"The company {ticker} already exists in the database as '{existing['company_name']}'.")
 
-            # Insert new company
             cursor.execute("""
                 INSERT INTO companies (company_name, ticker, sector)
                 VALUES (%s, %s, 'Cybersecurity')
@@ -422,7 +538,7 @@ You can now:
 - View forecasts: "Show forecast for {ticker}"
 - Get company info: "Tell me about {ticker}"
 
-Note: You'll need to add SEC filings and earnings transcripts to S3 before full analysis is available."""
+Note: You'll need to scrape SEC filings and earnings transcripts before full analysis is available."""
 
             return close_response(session_attributes, 'Fulfilled', message)
 
@@ -430,16 +546,13 @@ Note: You'll need to add SEC filings and earnings transcripts to S3 before full 
             return close_response(session_attributes, 'Failed',
                 f"Sorry, I couldn't add the company. Error: {str(e)}")
 
-    # First interaction - try to extract company from utterance
     company_name, ticker = extract_company_from_utterance(utterance)
 
     if company_name and ticker:
-        # We have both - try to add directly
         try:
             conn = get_db_connection()
             cursor = conn.cursor(cursor_factory=RealDictCursor)
 
-            # Check if already exists
             cursor.execute("SELECT * FROM companies WHERE ticker = %s", (ticker,))
             existing = cursor.fetchone()
 
@@ -449,7 +562,6 @@ Note: You'll need to add SEC filings and earnings transcripts to S3 before full 
                 return close_response(session_attributes, 'Fulfilled',
                     f"Good news! {company_name} ({ticker}) is already in the dashboard. You can start analyzing it right away!")
 
-            # Insert new company
             cursor.execute("""
                 INSERT INTO companies (company_name, ticker, sector)
                 VALUES (%s, %s, 'Cybersecurity')
@@ -472,14 +584,12 @@ You can now ask me about this company's sentiment analysis or forecasts."""
                 f"Sorry, I couldn't add the company. Error: {str(e)}")
 
     elif ticker:
-        # We have a ticker but need company name
         session_attributes['pending_action'] = 'add_company_ticker'
-        session_attributes['company_name'] = f"Company {ticker}"  # Placeholder
+        session_attributes['company_name'] = f"Company {ticker}"
         return elicit_response(session_attributes, "AddCompanyIntent",
             f"I found the ticker {ticker}. What is the full company name?")
 
     else:
-        # Need to ask for company details
         session_attributes['pending_action'] = 'add_company_name'
         return elicit_response(session_attributes, "AddCompanyIntent",
             "I'd be happy to help you add a new company! What is the company name?")
@@ -490,19 +600,16 @@ def handle_remove_company(event):
     utterance = event.get('inputTranscript', '')
     session_attributes = event.get('sessionState', {}).get('sessionAttributes', {})
 
-    # Check if we're confirming deletion
     pending_action = session_attributes.get('pending_action')
 
     if pending_action == 'confirm_remove':
         ticker = session_attributes.get('remove_ticker', '')
         company_name = session_attributes.get('remove_company_name', '')
 
-        # Clear session state
         session_attributes.pop('pending_action', None)
         session_attributes.pop('remove_ticker', None)
         session_attributes.pop('remove_company_name', None)
 
-        # Check for confirmation
         if any(word in utterance.lower() for word in ['yes', 'confirm', 'delete', 'remove', 'ok', 'sure']):
             try:
                 conn = get_db_connection()
@@ -527,11 +634,9 @@ def handle_remove_company(event):
             return close_response(session_attributes, 'Fulfilled',
                 f"OK, I won't remove {company_name}. The company will remain in the dashboard.")
 
-    # Try to extract company from utterance
     company_name, ticker = extract_company_from_utterance(utterance)
 
     if ticker:
-        # Look up the company
         try:
             conn = get_db_connection()
             cursor = conn.cursor(cursor_factory=RealDictCursor)
@@ -555,7 +660,6 @@ def handle_remove_company(event):
                 f"Sorry, I encountered an error: {str(e)}")
 
     else:
-        # Ask which company to remove
         return elicit_response(session_attributes, "RemoveCompanyIntent",
             "Which company would you like to remove? Please provide the company name or ticker symbol.")
 
@@ -579,32 +683,34 @@ def elicit_response(session_attributes, intent_name, message):
 
 
 def handle_document_inventory(event):
-    """Handle document inventory queries - shows what documents are available for a company"""
-    utterance = event.get('inputTranscript', '')
+    """Handle document inventory queries"""
     session_attributes = event.get('sessionState', {}).get('sessionAttributes', {})
+    slots = event['sessionState']['intent']['slots'] or {}
+    company_name = None
+    ticker = None
 
-    # Try to extract company from utterance
-    company_name, ticker = extract_company_from_utterance(utterance)
+    # Try to get company from slots first
+    if slots.get('CompanyName'):
+        company_name = slots['CompanyName'].get('value', {}).get('interpretedValue', '')
 
-    # If we got a ticker from the static map, try database lookup for more details
-    if ticker:
-        company_id, db_ticker, db_company_name = find_company_by_alias(ticker)
+    # If no slot, extract from utterance
+    if not company_name:
+        utterance = event.get('inputTranscript', '')
+        extracted_name, extracted_ticker = extract_company_from_utterance(utterance)
+        if extracted_ticker:
+            company_name = extracted_ticker
+            ticker = extracted_ticker
+        elif extracted_name:
+            company_name = extracted_name
+
+    # Look up the ticker if we don't have it
+    if company_name and not ticker:
+        company_id, db_ticker, db_company_name = find_company_by_alias(company_name)
         if db_ticker:
             ticker = db_ticker
             company_name = db_company_name
-    elif not company_name:
-        # Try to find any company name in the utterance using database aliases
-        words = utterance.lower().split()
-        for i in range(len(words)):
-            for j in range(i + 1, min(i + 4, len(words) + 1)):
-                phrase = ' '.join(words[i:j])
-                company_id, db_ticker, db_company_name = find_company_by_alias(phrase)
-                if db_ticker:
-                    ticker = db_ticker
-                    company_name = db_company_name
-                    break
-            if ticker:
-                break
+        else:
+            ticker = company_name.upper()
 
     if not ticker:
         return elicit_response(session_attributes, "DocumentInventoryIntent",
@@ -614,7 +720,6 @@ def handle_document_inventory(event):
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
 
-        # Get document inventory
         cursor.execute("""
             SELECT
                 artifact_type,
@@ -653,10 +758,7 @@ You can analyze sentiment on these documents by asking "What is the sentiment fo
         else:
             message = f"""I don't have any documents for {company_name} ({ticker}) in the database yet.
 
-To add documents, you'll need to:
-1. Upload SEC filings (10-K, 10-Q) to S3
-2. Upload earnings call transcripts to S3
-3. Run the data migration script
+To add documents, use the "Start Scraping" button on the dashboard to fetch SEC filings and earnings transcripts.
 
 Would you like to add a different company instead?"""
 
@@ -668,136 +770,152 @@ Would you like to add a different company instead?"""
 
 
 def handle_growth_metrics(event):
-    """Handle growth metrics queries - shows employee and hiring trends"""
-    utterance = event.get('inputTranscript', '')
+    """Handle growth metrics queries - calls the API for fresh data"""
     session_attributes = event.get('sessionState', {}).get('sessionAttributes', {})
+    slots = event['sessionState']['intent']['slots'] or {}
+    company_name = None
+    ticker = None
 
-    # Try to extract company from utterance
-    company_name, ticker = extract_company_from_utterance(utterance)
+    # Try to get company from slots first
+    if slots.get('CompanyName'):
+        company_name = slots['CompanyName'].get('value', {}).get('interpretedValue', '')
 
-    if ticker:
-        company_id, db_ticker, db_company_name = find_company_by_alias(ticker)
+    # If no slot, extract from utterance
+    if not company_name:
+        utterance = event.get('inputTranscript', '')
+        extracted_name, extracted_ticker = extract_company_from_utterance(utterance)
+        if extracted_ticker:
+            company_name = extracted_ticker
+            ticker = extracted_ticker
+        elif extracted_name:
+            company_name = extracted_name
+
+    # Look up the ticker if we don't have it
+    if company_name and not ticker:
+        company_id, db_ticker, db_company_name = find_company_by_alias(company_name)
         if db_ticker:
             ticker = db_ticker
             company_name = db_company_name
+        else:
+            ticker = company_name.upper()
 
     if not ticker:
         return elicit_response(session_attributes, "GrowthMetricsIntent",
             "Which company would you like to see growth metrics for? Please provide the company name or ticker.")
 
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
+    # Call the growth API
+    print(f"Fetching growth metrics for ticker: {ticker}")
+    growth_data = call_api(f"/api/company-growth/{ticker}")
 
-        # Get the company ID
-        cursor.execute("SELECT id FROM companies WHERE LOWER(ticker) = LOWER(%s)", (ticker,))
-        company_row = cursor.fetchone()
+    if growth_data and 'error' not in growth_data:
+        company_info = growth_data.get('company', {})
+        emp_count = growth_data.get('employee_count', 'N/A')
+        job_velocity = growth_data.get('job_velocity', {})
+        tenure_stats = growth_data.get('tenure_stats', {})
+        from_cache = growth_data.get('from_cache', False)
 
-        if not company_row:
-            cursor.close()
-            conn.close()
-            return close_response(session_attributes, 'Fulfilled',
-                f"I couldn't find {ticker} in the database. Try listing companies first.")
+        cache_status = "(from cache)" if from_cache else "(freshly fetched)"
 
-        company_id = company_row['id']
+        message = f"""Growth Metrics for {company_name or ticker} {cache_status}:
 
-        # Get latest employee count
-        cursor.execute("""
-            SELECT employee_count, snapshot_date
-            FROM employee_counts
-            WHERE company_id = %s
-            ORDER BY snapshot_date DESC
-            LIMIT 1
-        """, (company_id,))
-        emp_row = cursor.fetchone()
+Employee Count: {emp_count:,} employees
+Job Velocity: {job_velocity.get('monthly_average', 'N/A')} postings/month
+Average Tenure: {tenure_stats.get('average_months', 'N/A')} months
 
-        # Get hiring event count (last 90 days)
-        cursor.execute("""
-            SELECT COUNT(*) as event_count
-            FROM hiring_events
-            WHERE company_id = %s
-              AND event_date >= CURRENT_DATE - 90
-              AND event_type = 'job_posting'
-        """, (company_id,))
-        hiring_row = cursor.fetchone()
+Hiring Trend: {job_velocity.get('trend', 'N/A')}
 
-        # Get growth trend
-        cursor.execute("""
-            SELECT trend_classification, trend_value, computed_at
-            FROM growth_trends
-            WHERE company_id = %s AND metric_type = 'overall'
-            ORDER BY computed_at DESC
-            LIMIT 1
-        """, (company_id,))
-        trend_row = cursor.fetchone()
+This data is sourced from Explorium and provides insights into company growth patterns."""
 
-        cursor.close()
-        conn.close()
+    elif growth_data and 'error' in growth_data:
+        message = f"I couldn't fetch growth metrics for {ticker}: {growth_data.get('error', 'Unknown error')}"
+    else:
+        message = f"I'm having trouble fetching growth data for {ticker}. Please try the Company Growth tab on the dashboard."
 
-        # Build response message
-        parts = [f"Growth Metrics for {company_name} ({ticker}):\n"]
-
-        if emp_row:
-            parts.append(f"Employee Count: {emp_row['employee_count']:,} (as of {emp_row['snapshot_date']})")
-        else:
-            parts.append("Employee Count: Data not yet available")
-
-        if hiring_row:
-            event_count = hiring_row['event_count']
-            if event_count > 50:
-                hiring_status = f"Very Active ({event_count} job postings in last 90 days)"
-            elif event_count > 20:
-                hiring_status = f"Active ({event_count} job postings in last 90 days)"
-            elif event_count > 5:
-                hiring_status = f"Moderate ({event_count} job postings in last 90 days)"
-            else:
-                hiring_status = f"Limited ({event_count} job postings in last 90 days)"
-            parts.append(f"Hiring Activity: {hiring_status}")
-        else:
-            parts.append("Hiring Activity: Data not yet available")
-
-        if trend_row:
-            trend = trend_row['trend_classification'].title()
-            parts.append(f"Growth Trend: {trend}")
-        else:
-            parts.append("Growth Trend: Not enough data to calculate")
-
-        parts.append("\nNote: Growth data is sourced from Explorium and updated periodically.")
-        parts.append("View the Company Growth tab on the dashboard for detailed charts.")
-
-        message = '\n'.join(parts)
-        return close_response(session_attributes, 'Fulfilled', message)
-
-    except Exception as e:
-        return close_response(session_attributes, 'Failed',
-            f"Sorry, I couldn't retrieve growth metrics. Error: {str(e)}")
+    return close_response(session_attributes, 'Fulfilled', message)
 
 
 def handle_fallback(event):
-    """Handle unrecognized input"""
-    message = """I'm not sure I understood that. Here are some things you can ask me:
+    """Handle fallback when no intent is matched - use company context if available"""
+    utterance = event.get('inputTranscript', '').lower()
 
-- "What companies are available?"
-- "Tell me about CrowdStrike"
-- "What is the sentiment for Palo Alto Networks?"
-- "Show me the forecast for Fortinet"
-- "What features does the dashboard have?"
-- "What documents do I have for CRWD?" (NEW!)
-- "Show growth metrics for Palo Alto" (NEW!)
-- "Add a new company"
-- "Remove a company"
+    # Try to extract company from utterance for context
+    company_name, ticker = extract_company_from_utterance(utterance)
 
-Or just say "help" to see all options."""
+    if ticker:
+        # User mentioned a company - provide helpful context
+        message = f"""{company_name or ticker} is a cybersecurity company tracked in the dashboard.
+
+You can ask me:
+- "What is the sentiment for {ticker}?" - Analyze SEC filings and transcripts
+- "Show forecast for {ticker}" - Get 30-day price predictions
+- "What documents do I have for {ticker}?" - See available filings
+- "Growth metrics for {ticker}" - View employee and hiring trends
+
+Or try "list companies" to see all available companies."""
+    else:
+        message = """I'm sorry, I didn't understand that. Could you please rephrase?
+
+Here are some things you can ask me:
+- "List companies" - Show all available companies
+- "Sentiment for CrowdStrike" - Get sentiment analysis
+- "Forecast for PANW" - Get price predictions
+- "What documents do I have for Zscaler?" - See document inventory
+- "Growth metrics for CRWD" - View hiring trends
+- "Help" - See all available commands"""
 
     return close_response({}, 'Fulfilled', message)
 
+
+def delegate_to_lex(event):
+    """Delegate control back to Lex for dialog management"""
+    return {
+        'sessionState': {
+            'sessionAttributes': event.get('sessionState', {}).get('sessionAttributes', {}),
+            'dialogAction': {
+                'type': 'Delegate'
+            },
+            'intent': event['sessionState']['intent']
+        }
+    }
+
+
 def handler(event, context):
     """Main Lambda handler for Lex V2"""
-    print(f"Event: {json.dumps(event)}")
+    print(f"Received event: {json.dumps(event)}")
 
     intent_name = event['sessionState']['intent']['name']
+    invocation_source = event.get('invocationSource', 'FulfillmentCodeHook')
 
-    intent_handlers = {
+    print(f"Intent: {intent_name}, Invocation: {invocation_source}")
+
+    # For DialogCodeHook, check if we have all required slots
+    # If so, handle immediately; otherwise delegate to Lex
+    if invocation_source == 'DialogCodeHook':
+        slots = event['sessionState']['intent'].get('slots', {})
+
+        # For intents that need a company name, check if slot is filled
+        intents_needing_company = ['ForecastIntent', 'SentimentAnalysisIntent',
+                                   'GrowthMetricsIntent', 'DocumentInventoryIntent',
+                                   'AddCompanyIntent', 'RemoveCompanyIntent', 'CompanyInfoIntent']
+
+        if intent_name in intents_needing_company:
+            company_slot = slots.get('CompanyName', {})
+            if company_slot and company_slot.get('value', {}).get('interpretedValue'):
+                # Slot is filled - handle the request now
+                print(f"Slot filled, handling {intent_name} directly")
+                pass  # Continue to handler
+            else:
+                # Slot not filled - delegate to Lex to elicit
+                print(f"Slot not filled, delegating to Lex")
+                return delegate_to_lex(event)
+        elif intent_name in ['WelcomeIntent', 'ListCompaniesIntent', 'DashboardFeaturesIntent', 'FallbackIntent']:
+            # These don't need slots - handle immediately
+            pass
+        else:
+            # Unknown intent - delegate
+            return delegate_to_lex(event)
+
+    handlers = {
         'WelcomeIntent': handle_welcome,
         'ListCompaniesIntent': handle_list_companies,
         'CompanyInfoIntent': handle_company_info,
@@ -808,16 +926,10 @@ def handler(event, context):
         'RemoveCompanyIntent': handle_remove_company,
         'DocumentInventoryIntent': handle_document_inventory,
         'GrowthMetricsIntent': handle_growth_metrics,
-        'FallbackIntent': handle_fallback
+        'FallbackIntent': handle_fallback,
     }
 
-    handler_func = intent_handlers.get(intent_name, handle_fallback)
-    response = handler_func(event)
-
-    # Add intent name to response if not already present
-    if 'intent' not in response['sessionState']:
-        response['sessionState']['intent'] = {}
-    response['sessionState']['intent']['name'] = intent_name
-
-    print(f"Response: {json.dumps(response)}")
-    return response
+    handler_func = handlers.get(intent_name, handle_fallback)
+    result = handler_func(event)
+    print(f"Returning: {json.dumps(result)}")
+    return result
