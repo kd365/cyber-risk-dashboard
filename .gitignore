@@ -1,29 +1,63 @@
-# Python artifacts
+# Python
 __pycache__/
 *.py[cod]
-*.egg
+*$py.class
+*.so
+venv/
+.venv/
+ENV/
+.Python
 *.egg-info/
 dist/
 build/
 
-# Virtual environments
-venv/
-.env
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
 
-# OS-specific files
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+# Keep terraform.tfvars for structure example (passwords obfuscated)
+# Local overrides should be in terraform.tfvars.local
+terraform.tfvars.local
+*.auto.tfvars
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
 .DS_Store
 Thumbs.db
 
-# Logs and temp files
+# Logs
 *.log
-*.tmp
+logs/
 
-# Jupyter notebooks checkpoints
-.ipynb_checkpoints/
+# Build outputs - keep frontend/build for deployment
+# build/
+# dist/
 
-# Dash data artifacts
-data/processed/
-data/status_*.json
+# Archives
+*.tar.gz
+*.zip
 
-# AWS credentials (if any)
-.aws/
+# Secrets (never commit these)
+*.pem
+*.key
+secrets/
+credentials/
+
+# Lambda zip files (generated)
+terraform/modules/lex/*.zip
