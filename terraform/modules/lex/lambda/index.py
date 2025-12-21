@@ -53,7 +53,7 @@ def get_db_connection():
     """Create database connection"""
     return psycopg2.connect(**DB_CONFIG)
 
-def call_api(endpoint, timeout=30):
+def call_api(endpoint, timeout=60):
     """Call the backend API and return JSON response"""
     try:
         url = f"{API_BASE_URL}{endpoint}"
@@ -401,7 +401,7 @@ def handle_forecast(event):
         else:
             ticker = company_name.upper()
 
-    forecast_data = call_api(f"/api/forecast?ticker={ticker}&days=30", timeout=10)
+    forecast_data = call_api(f"/api/forecast?ticker={ticker}&days=30", timeout=60)
 
     if forecast_data and 'error' not in forecast_data:
         current_price = forecast_data.get('current_price', 0)
@@ -421,7 +421,7 @@ def handle_forecast(event):
             trend = "strong downward trend"
 
         # Try to get model evaluation metrics
-        eval_data = call_api(f"/api/evaluate/{ticker}", timeout=10)
+        eval_data = call_api(f"/api/evaluate/{ticker}", timeout=60)
         mape_str = ""
         if eval_data and 'mape' in eval_data:
             mape = eval_data.get('mape', 0)
