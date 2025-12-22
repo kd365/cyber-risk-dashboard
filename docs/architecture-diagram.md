@@ -190,9 +190,10 @@
 │  │  │  ┌───────────────────────────────────┐  │  │  ┌───────────────────────────────┐  │  │ │
 │  │  │  │        EC2 Instance               │  │  │  │       RDS PostgreSQL          │  │  │ │
 │  │  │  │  ┌─────────────────────────────┐  │  │  │  │  ┌─────────────────────────┐  │  │  │ │
-│  │  │  │  │ Private IP: 10.0.0.x        │  │  │  │  │  │ Endpoint: cyberrisk-   │  │  │  │ │
+│  │  │  │  │ Private IP: 10.0.0.114       │  │  │  │  │  │ Endpoint: cyberrisk-   │  │  │  │ │
 │  │  │  │  │ EIP: 52.41.126.148          │  │──┼──┼──┼──│ dev-kh-postgres...     │  │  │  │ │
 │  │  │  │  │ SG: ec2-sg (22,80,443,5000) │  │  │  │  │  │ Port: 5432             │  │  │  │ │
+│  │  │  │  │ Gunicorn: 2 workers         │  │  │  │  │  │                        │  │  │  │ │
 │  │  │  │  └─────────────────────────────┘  │  │  │  │  │ SG: rds-sg (5432)      │  │  │  │ │
 │  │  │  └───────────────────────────────────┘  │  │  │  └─────────────────────────┘  │  │  │ │
 │  │  │  ┌───────────────────────────────────┐  │  │  │  ┌─────────────────────────┐  │  │  │ │
@@ -406,7 +407,8 @@ User → CloudFront → EC2 (/api/lex/message) → Lex V2 Bot → Lambda (VPC)
 │                                 AMAZON LEX V2                                                │
 │  ┌───────────────────────────────────────────────────────────────────────────────────────┐  │
 │  │  Bot Name: cyberrisk-dev-kh-bot                                                       │  │
-│  │  Bot ID: 7GHDINGVTV                                                                   │  │
+│  │  Bot ID: QH0GWIQ7CE                                                                   │  │
+│  │  Aliases: TestBotAlias (TSTALIASID), production (VCURVLEXHA)                          │  │
 │  │                                                                                        │  │
 │  │  ┌──────────────────────────────────────────────────────────────────────────────────┐ │  │
 │  │  │                              INTENTS                                              │ │  │
@@ -428,10 +430,12 @@ User → CloudFront → EC2 (/api/lex/message) → Lex V2 Bot → Lambda (VPC)
 │  │  │  └────────────────────┘                                                          │ │  │
 │  │  └──────────────────────────────────────────────────────────────────────────────────┘ │  │
 │  │                                                                                        │  │
-│  │  Lambda Fulfillment: cyberrisk-dev-kh-lex-fulfillment                                 │  │
-│  │    - Runs in VPC private subnets                                                      │  │
+│  │  Lambda Fulfillment: cyberrisk-dev-kh-lex-fulfillment (Version 4)                     │  │
+│  │    - Runs in VPC private subnets (10.0.10.0/24, 10.0.11.0/24)                        │  │
+│  │    - Provisioned Concurrency: 1 (eliminates cold starts)                              │  │
+│  │    - Calls EC2 APIs for sentiment, forecast, growth data                              │  │
 │  │    - Queries RDS for company/document data                                            │  │
-│  │    - Extracts entities from user utterances                                           │  │
+│  │    - Uses ConfirmIntent for multi-turn dialogs (e.g., remove company)                 │  │
 │  └───────────────────────────────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -492,7 +496,9 @@ cyber-risk-deploy/
 | RDS Endpoint | cyberrisk-dev-kh-postgres.c05bdkwjrggh.us-west-2.rds.amazonaws.com:5432 |
 | S3 Frontend Bucket | cyberrisk-dev-kh-frontend-u7tro1vp |
 | S3 Artifacts Bucket | cyber-risk-artifacts |
-| Lex Bot ID | 7GHDINGVTV |
+| Lex Bot ID | QH0GWIQ7CE |
+| Lex Production Alias | VCURVLEXHA |
+| Lambda Version | 4 |
 | Region | us-west-2 |
 
 ---

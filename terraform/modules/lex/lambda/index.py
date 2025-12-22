@@ -136,7 +136,7 @@ def find_company_by_alias(search_term):
         print(f"Error finding company by alias: {e}")
         return (None, None, None)
 
-def close_response(session_attributes, fulfillment_state, message):
+def close_response(session_attributes, fulfillment_state, message, intent_name=None):
     """Build Lex V2 response"""
     return {
         'sessionState': {
@@ -145,6 +145,7 @@ def close_response(session_attributes, fulfillment_state, message):
                 'type': 'Close'
             },
             'intent': {
+                'name': intent_name,
                 'state': fulfillment_state
             }
         },
@@ -599,18 +600,23 @@ def handle_remove_company(event):
     """Handle removing a company from the database"""
     utterance = event.get('inputTranscript', '')
     session_attributes = event.get('sessionState', {}).get('sessionAttributes', {})
+    intent = event['sessionState']['intent']
+    slots = intent.get('slots', {}) or {}
+    confirmation_state = intent.get('confirmationState', 'None')
 
-    pending_action = session_attributes.get('pending_action')
-
-    if pending_action == 'confirm_remove':
+    # Check if user confirmed or denied
+    if confirmation_state == 'Confirmed':
+        # User said yes - proceed with deletion
         ticker = session_attributes.get('remove_ticker', '')
         company_name = session_attributes.get('remove_company_name', '')
 
-        session_attributes.pop('pending_action', None)
-        session_attributes.pop('remove_ticker', None)
-        session_attributes.pop('remove_company_name', None)
+        if not ticker:
+            # Try to get from slots
+            if slots.get('CompanyName'):
+                company_input = slots['CompanyName'].get('value', {}).get('interpretedValue', '')
+                _, ticker, company_name = find_company_by_alias(company_input)
 
-        if any(word in utterance.lower() for word in ['yes', 'confirm', 'delete', 'remove', 'ok', 'sure']):
+        if ticker:
             try:
                 conn = get_db_connection()
                 cursor = conn.cursor()
@@ -621,20 +627,35 @@ def handle_remove_company(event):
                 conn.close()
 
                 if deleted:
-                    return close_response(session_attributes, 'Fulfilled',
+                    return close_response({}, 'Fulfilled',
                         f"Done! {company_name} ({ticker}) has been removed from the dashboard.")
                 else:
-                    return close_response(session_attributes, 'Fulfilled',
+                    return close_response({}, 'Fulfilled',
                         f"Hmm, I couldn't find {ticker} in the database. It may have already been removed.")
 
             except Exception as e:
-                return close_response(session_attributes, 'Failed',
+                return close_response({}, 'Failed',
                     f"Sorry, I couldn't remove the company. Error: {str(e)}")
         else:
-            return close_response(session_attributes, 'Fulfilled',
-                f"OK, I won't remove {company_name}. The company will remain in the dashboard.")
+            return close_response({}, 'Failed',
+                "I couldn't determine which company to remove. Please try again.")
 
+    elif confirmation_state == 'Denied':
+        # User said no
+        company_name = session_attributes.get('remove_company_name', 'the company')
+        return close_response({}, 'Fulfilled',
+            f"OK, I won't remove {company_name}. The company will remain in the dashboard.")
+
+    # First time - need to find company and ask for confirmation
     company_name, ticker = extract_company_from_utterance(utterance)
+
+    # Also try slots
+    if not ticker and slots.get('CompanyName'):
+        slot_value = slots['CompanyName'].get('value', {}).get('interpretedValue', '')
+        if slot_value:
+            _, ticker, company_name = find_company_by_alias(slot_value)
+            if not company_name:
+                company_name = slot_value
 
     if ticker:
         try:
@@ -646,17 +667,35 @@ def handle_remove_company(event):
             conn.close()
 
             if company:
-                session_attributes['pending_action'] = 'confirm_remove'
+                # Store info in session and ask for confirmation using ConfirmIntent
                 session_attributes['remove_ticker'] = ticker
                 session_attributes['remove_company_name'] = company['company_name']
-                return elicit_response(session_attributes, "RemoveCompanyIntent",
-                    f"Are you sure you want to remove {company['company_name']} ({ticker}) from the dashboard? This will delete any cached data. Reply 'yes' to confirm or 'no' to cancel.")
+
+                return {
+                    'sessionState': {
+                        'sessionAttributes': session_attributes,
+                        'dialogAction': {
+                            'type': 'ConfirmIntent'
+                        },
+                        'intent': {
+                            'name': 'RemoveCompanyIntent',
+                            'slots': slots,
+                            'state': 'InProgress'
+                        }
+                    },
+                    'messages': [
+                        {
+                            'contentType': 'PlainText',
+                            'content': f"Are you sure you want to remove {company['company_name']} ({ticker}) from the dashboard? This will delete any cached data."
+                        }
+                    ]
+                }
             else:
-                return close_response(session_attributes, 'Fulfilled',
+                return close_response({}, 'Fulfilled',
                     f"I couldn't find a company with ticker {ticker} in the database. Use 'list companies' to see available companies.")
 
         except Exception as e:
-            return close_response(session_attributes, 'Failed',
+            return close_response({}, 'Failed',
                 f"Sorry, I encountered an error: {str(e)}")
 
     else:
@@ -931,5 +970,11 @@ def handler(event, context):
 
     handler_func = handlers.get(intent_name, handle_fallback)
     result = handler_func(event)
+
+    # Ensure intent name is always included in the response (Lex V2 requirement)
+    if 'sessionState' in result and 'intent' in result['sessionState']:
+        if result['sessionState']['intent'].get('name') is None:
+            result['sessionState']['intent']['name'] = intent_name
+
     print(f"Returning: {json.dumps(result)}")
     return result
