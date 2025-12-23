@@ -1,37 +1,12 @@
 # CyberRisk Dashboard - AWS Deployment
+## Created By: Kathleen Hill
+### Utilizing Claude Code
 
-This project deploys the CyberRisk Dashboard to AWS using Terraform, with RDS PostgreSQL, EC2/Gunicorn backend, S3/CloudFront frontend, and Amazon Lex chatbot integration.
+This project deploys a CyberRisk Dashboard to AWS using Terraform, with RDS PostgreSQL, EC2/Gunicorn backend, S3/CloudFront frontend, and Amazon Lex chatbot integration.
 
 ## Architecture
 
-```
-                                    ┌─────────────────────┐
-                                    │     CloudFront      │
-                                    │   (CDN + HTTPS)     │
-                                    └──────────┬──────────┘
-                                               │
-                         ┌─────────────────────┴─────────────────────┐
-                         │                                           │
-                         ▼                                           ▼
-               ┌─────────────────┐                         ┌─────────────────┐
-               │   S3 Bucket     │                         │   EC2 Instance  │
-               │ (React Frontend)│                         │ (Flask/Gunicorn)│
-               └─────────────────┘                         └────────┬────────┘
-                                                                    │
-                    ┌───────────────────────────────────────────────┼───────────┐
-                    │                                               │           │
-                    ▼                                               ▼           ▼
-          ┌─────────────────┐                              ┌─────────────┐  ┌──────────┐
-          │  Amazon Lex V2  │                              │    RDS      │  │ Comprehend│
-          │   (Chatbot)     │                              │ PostgreSQL  │  │   (NLP)   │
-          └────────┬────────┘                              └─────────────┘  └──────────┘
-                   │
-                   ▼
-          ┌─────────────────┐
-          │     Lambda      │
-          │ (Lex Fulfillment)│
-          └─────────────────┘
-```
+![Project Architecture](docs/architecture-diagram.png)
 
 ## AWS Services Used
 
@@ -60,8 +35,8 @@ This project deploys the CyberRisk Dashboard to AWS using Terraform, with RDS Po
 
 ```bash
 cd terraform
-cp terraform.tfvars.example terraform.tfvars
-# Edit terraform.tfvars with your values
+cp terraform.tfvars
+
 ```
 
 Required variables:
@@ -211,20 +186,6 @@ terraform output lex_bot_id
 4. **Company Growth** - Workforce trends from Explorium
 5. **AI Assistant** - Amazon Lex chatbot for navigation help
 
-## Cost Estimates
-
-| Resource | Instance/Size | Est. Monthly Cost |
-|----------|--------------|-------------------|
-| RDS PostgreSQL | db.t3.micro | ~$15 |
-| EC2 | t3.micro | ~$8 |
-| CloudFront | 100GB transfer | ~$9 |
-| S3 | <1GB storage | ~$0.02 |
-| Lex | 1000 requests | ~$0.75 |
-| Comprehend | 100k units | ~$5 |
-| Lambda | 10k invocations | ~$0 (free tier) |
-| NAT Gateway | Per hour | ~$32 |
-
-**Total estimated: ~$70/month** (can reduce by removing NAT Gateway)
 
 ## Security
 
